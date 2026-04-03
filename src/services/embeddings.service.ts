@@ -485,7 +485,12 @@ async function getOrCreateTable(seedRows?: EmbeddingRow[]): Promise<Table> {
   return table;
 }
 
-const MIN_ROWS_FOR_VECTOR_INDEX = 5_000;
+// IVF indexing only pays off once the dataset is large enough for KMeans to
+// form meaningful clusters. Below this threshold brute-force (flat) search is
+// both faster and more accurate — especially with the heavy .where() filtering
+// every query in Lumiverse uses. Rule of thumb: need ≥ 256 rows per partition,
+// and sqrt(50K)≈224 partitions → 224*256 ≈ 57K, so 50K is a safe lower bound.
+const MIN_ROWS_FOR_VECTOR_INDEX = 50_000;
 let scalarIndexReady = false;
 let ftsIndexReady = false;
 const MAX_LANCE_SOURCE_FILTER_IDS = 250;
@@ -620,7 +625,9 @@ async function ensureVectorIndex(table: Table): Promise<void> {
     }
     // IVF_PQ handles metadata-filtered workloads (every query uses .where())
     // much better than HNSW_PQ, which suffers latency fluctuation with filters.
-    const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount)));
+    // Partition count: target ≥256 rows per partition to avoid KMeans empty-cluster
+    // warnings and ensure each centroid has enough data to be meaningful.
+    const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount / 256)));
     await table.createIndex("vector", {
       config: Index.ivfPq({
         distanceType: "cosine",
@@ -775,7 +782,14 @@ async function checkAndRebuildIndexes(table: Table): Promise<void> {
     if (unindexed >= UNINDEXED_ROW_THRESHOLD) {
       console.info(`[embeddings] ${unindexed} unindexed rows detected, rebuilding vector index...`);
       const rowCount = await table.countRows();
-      const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount)));
+      if (rowCount < MIN_ROWS_FOR_VECTOR_INDEX) {
+        // Dataset shrank below threshold — drop index, brute-force is better
+        console.info(`[embeddings] Row count (${rowCount}) below IVF threshold, skipping index rebuild`);
+        lastIndexRebuildAt = Date.now();
+        unindexedRowEstimate = 0;
+        return;
+      }
+      const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount / 256)));
       await table.createIndex("vector", {
         config: Index.ivfPq({
           distanceType: "cosine",
@@ -831,11 +845,12 @@ export async function runStartupVectorMaintenance(): Promise<void> {
     console.warn("[embeddings] Startup compaction failed:", err);
   }
 
+  const rowCount = await table.countRows();
+
   if (needsMigration) {
-    const rowCount = await table.countRows();
     if (rowCount >= MIN_ROWS_FOR_VECTOR_INDEX) {
       console.info(`[embeddings] Migrating vector index from HNSW_PQ → IVF_PQ (${rowCount} rows)...`);
-      const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount)));
+      const numPartitions = Math.max(2, Math.floor(Math.sqrt(rowCount / 256)));
       try {
         await table.createIndex("vector", {
           config: Index.ivfPq({
@@ -850,7 +865,14 @@ export async function runStartupVectorMaintenance(): Promise<void> {
       } catch (err) {
         console.warn("[embeddings] Vector index migration failed (will retry on next query):", err);
       }
+    } else {
+      console.info(`[embeddings] Skipping HNSW→IVF migration: ${rowCount} rows below IVF threshold (${MIN_ROWS_FOR_VECTOR_INDEX}), brute-force is optimal`);
     }
+  } else if (vectorIdx && rowCount < MIN_ROWS_FOR_VECTOR_INDEX) {
+    // Existing IVF index on a dataset below threshold — the old lower threshold
+    // (5K) caused unnecessary IVF indexing. Log it; LanceDB will fall through to
+    // brute-force when the index is stale, and ensureVectorIndex won't rebuild it.
+    console.info(`[embeddings] Existing vector index found but ${rowCount} rows < ${MIN_ROWS_FOR_VECTOR_INDEX} threshold — brute-force search will be used`);
   }
 
   // Force-rebuild scalar + FTS indexes after compaction cleanup to avoid stale
@@ -1520,8 +1542,9 @@ export async function searchWorldBookEntriesHybridWithVector(
     .where(filter)
     .select(["source_id", "content", "_distance", "metadata_json"])
     .limit(effectiveLimit) as any;
-  // Refine with full vectors after PQ approximate search for better accuracy
-  if (vectorIndexReady) query.refineFactor(5);
+  // When IVF index is active, search enough partitions for good recall on
+  // filtered workloads, and refine with full vectors after PQ approximation.
+  if (vectorIndexReady) { query.nprobes(10); query.refineFactor(5); }
   const vectorRows = await query.toArray();
 
   const merged = new Map<string, WorldBookSearchCandidate>();
@@ -1918,8 +1941,9 @@ export async function searchChatChunks(
 
   // Try hybrid search when query text is available
   let rows: any[];
-  // Refine with full vectors after PQ approximate search for better accuracy
-  const applyRefineFactor = (q: any) => { if (vectorIndexReady) q.refineFactor(5); return q; };
+  // When IVF index is active, search enough partitions for good recall and
+  // refine with full vectors after PQ approximation.
+  const applyIvfTuning = (q: any) => { if (vectorIndexReady) { q.nprobes(10); q.refineFactor(5); } return q; };
   if (queryText?.trim() && hybridWeightMode !== "vector_first") {
     try {
       const reranker = await rerankers.RRFReranker.create();
@@ -1931,7 +1955,7 @@ export async function searchChatChunks(
         .rerank(reranker)
         .select(["source_id", "content", "_distance", "_relevance_score", "metadata_json", "vector"])
         .limit(fetchLimit);
-      rows = await applyRefineFactor(q).toArray();
+      rows = await applyIvfTuning(q).toArray();
     } catch {
       // FTS index may not exist yet — fall back to vector-only
       const q = table
@@ -1940,7 +1964,7 @@ export async function searchChatChunks(
         .where(filter)
         .select(["source_id", "content", "_distance", "metadata_json", "vector"])
         .limit(fetchLimit);
-      rows = await applyRefineFactor(q).toArray();
+      rows = await applyIvfTuning(q).toArray();
     }
   } else {
     const q = table
@@ -1949,7 +1973,7 @@ export async function searchChatChunks(
       .where(filter)
       .select(["source_id", "content", "_distance", "metadata_json", "vector"])
       .limit(fetchLimit);
-    rows = await applyRefineFactor(q).toArray();
+    rows = await applyIvfTuning(q).toArray();
   }
 
   // Parse and exclude
@@ -2245,7 +2269,7 @@ export async function searchDatabankChunks(
   const fetchLimit = Math.max(1, Math.min(limit + 20, 100));
 
   let rows: any[];
-  const applyRefineFactor = (q: any) => { if (vectorIndexReady) q.refineFactor(5); return q; };
+  const applyIvfTuning = (q: any) => { if (vectorIndexReady) { q.nprobes(10); q.refineFactor(5); } return q; };
 
   if (queryText?.trim()) {
     try {
@@ -2259,7 +2283,7 @@ export async function searchDatabankChunks(
         .rerank(reranker)
         .select(["source_id", "content", "_distance", "_relevance_score", "metadata_json"])
         .limit(fetchLimit);
-      rows = await applyRefineFactor(q).toArray();
+      rows = await applyIvfTuning(q).toArray();
     } catch {
       const q = table
         .query()
@@ -2267,7 +2291,7 @@ export async function searchDatabankChunks(
         .where(filter)
         .select(["source_id", "content", "_distance", "metadata_json"])
         .limit(fetchLimit);
-      rows = await applyRefineFactor(q).toArray();
+      rows = await applyIvfTuning(q).toArray();
     }
   } else {
     const q = table
@@ -2276,7 +2300,7 @@ export async function searchDatabankChunks(
       .where(filter)
       .select(["source_id", "content", "_distance", "metadata_json"])
       .limit(fetchLimit);
-    rows = await applyRefineFactor(q).toArray();
+    rows = await applyIvfTuning(q).toArray();
   }
 
   const results: Array<{ chunk_id: string; score: number; content: string; metadata: any }> = [];
