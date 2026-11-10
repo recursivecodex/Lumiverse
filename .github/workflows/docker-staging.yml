@@ -19,11 +19,6 @@ on:
       - "bun.lock"
       - "Dockerfile"
       - ".dockerignore"
-  schedule:
-    # Daily staging rebuild from the `staging` branch. Runs once per day so we
-    # don't burn through the GitHub Actions free tier on every commit but still
-    # get a current `:staging` image for Docker-based environments.
-    - cron: "0 5 * * *"  # Daily 05:00 UTC
   workflow_dispatch:
 
 jobs:

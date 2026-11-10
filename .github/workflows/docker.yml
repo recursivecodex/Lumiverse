@@ -8,12 +8,6 @@ on:
     # instead: tags that change nothing the image compiles, runs, or
     # documents skip the build. Weekly schedule and manual dispatch always
     # build and are not diff-gated.
-  schedule:
-    # Weekly rebuild to refresh the CA certificate bundle baked into `:latest`.
-    # Combined with the CA_REFRESH build-arg below, this forces apt to pull the
-    # current `ca-certificates` package so TLS trust stays in sync with Mozilla
-    # root updates without waiting for a Lumiverse release.
-    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
   workflow_dispatch:
 
 jobs:

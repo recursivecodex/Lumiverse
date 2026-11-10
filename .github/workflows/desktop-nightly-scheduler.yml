@@ -3,8 +3,6 @@ name: Schedule Nightly Bundled Desktop Release
 # GitHub evaluates cron only on the default branch. Keep this scheduler on
 # main and merge it back into staging; the actual release runs on staging.
 on:
-  schedule:
-    - cron: '23 5 * * *'
   workflow_dispatch:
 
 permissions:
